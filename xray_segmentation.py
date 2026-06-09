@@ -22,6 +22,32 @@ def put_cn_text(im,txt,pos,sz,c):
     return cv2.cvtColor(np.array(pi),cv2.COLOR_RGB2BGR)
 c=lambda k:CN.get(k,k)
 
+def enhance_image(img):
+    """图像增强：CLAHE对比度增强 + 非锐化掩膜，提升清晰度同时降低干扰"""
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
+    enhanced = clahe.apply(img)
+    # 非锐化掩膜（Unsharp Masking）：高斯模糊后与原图做差，叠加回原图实现锐化
+    blurred = cv2.GaussianBlur(enhanced, (5, 5), 1.0)
+    sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+    return sharpened
+
+def enhance_edges(img):
+    """梯度增强：突出缺陷边缘，便于阈值分割捕捉"""
+    grad_x = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+    grad = cv2.magnitude(grad_x, grad_y)
+    grad = np.uint8(np.clip(grad, 0, 255))
+    return grad
+
+def filter_small_components(binary, min_area):
+    """连通域分析：过滤面积小于min_area的噪声区域"""
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    mask = np.zeros_like(binary)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            mask[labels == i] = 255
+    return mask
+
 def compute_features(cts,sh):
     fs,h,w,areaAll=[],sh[0],sh[1],sh[0]*sh[1]
     for idx,cnt in enumerate(cts):
@@ -58,7 +84,11 @@ def _hstack_panels(pns,th=20):
         can[:,x:x+img.shape[1]]=pan;x+=img.shape[1]
     return can
 
-def create_segmentation(img,pm,dm):return _hstack_panels([("原图",img),("零件掩膜(Otsu)",pm),("缺陷掩膜",dm)])
+def create_segmentation(img,pm,dm,en=None):
+    panels=[("原图",img)]
+    if en is not None:panels.append(("增强图(CLAHE)",en))
+    panels+=[("零件掩膜(Otsu)",pm),("缺陷掩膜",dm)]
+    return _hstack_panels(panels)
 def create_annotation(img,fs,dn,dm,tm):
     h,w=img.shape;leg=22
     ann=np.zeros((h+leg,w,3),np.uint8);ann[leg:]=cv2.cvtColor(img,cv2.COLOR_GRAY2BGR);ann[:leg]=(40,40,40)
@@ -114,7 +144,12 @@ def process_image(n):
     img=read_image(os.path.join(IMG_DIR,n))
     if img is None:print(f'失败:{n}');return
     stem=os.path.splitext(n)[0];h,w=img.shape;allA=h*w
-    blur=cv2.GaussianBlur(img,(5,5),0)
+    # --- 图像增强：CLAHE + 非锐化掩膜，提升清晰度 ---
+    enhanced=enhance_image(img)
+    grad=enhance_edges(img)
+    # 融合梯度信息（轻度），增强缺陷边缘供阈值分割使用
+    enhanced_grad=cv2.addWeighted(enhanced,0.85,grad,0.15,0)
+    blur=cv2.GaussianBlur(enhanced,(3,3),0)
     ot,otb=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
     tr,trb=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_TRIANGLE)
     k5,k7,k3=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)),cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(7,7)),cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
@@ -122,10 +157,14 @@ def process_image(n):
     pc,_=cv2.findContours(pm,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
     pc=[i for i in pc if cv2.contourArea(i)>allA*0.005]
     pmc=np.zeros_like(pm);cv2.drawContours(pmc,pc,-1,255,cv2.FILLED)
+    # --- 缺陷检测：梯度增强 + 中值滤波去椒盐噪声 ---
     bs=max(11,(min(h,w)//15)|1)
-    adg=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,bs,3)
+    adg=cv2.adaptiveThreshold(enhanced_grad,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,bs,2)
     adgc=cv2.morphologyEx(adg,cv2.MORPH_OPEN,k3)
+    adgc=cv2.medianBlur(adgc,3)
     dfm=cv2.bitwise_and(adgc,pmc)
+    # 连通域过滤：去除小面积噪声
+    dfm=filter_small_components(dfm,int(allA*0.00001))
     dfc,_=cv2.findContours(dfm,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
     dfc=[i for i in dfc if cv2.contourArea(i)>allA*0.00002]
     dfmask=np.zeros_like(dfm);cv2.drawContours(dfmask,dfc,-1,255,cv2.FILLED)
@@ -136,15 +175,15 @@ def process_image(n):
     cot,_=cv2.findContours(otc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
     ctr,_=cv2.findContours(tric,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
     gr={'otsu_val':ot,'tri_val':tr,'otsu_bin':otc,'tri_bin':tric,'feats_otsu':compute_features(cot,img.shape),'feats_tri':compute_features(ctr,img.shape)}
-    #自适应
-    adm=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,bs,3)
-    admb=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,bs,3)
+    #自适应（对比用）
+    adm=cv2.adaptiveThreshold(enhanced_grad,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,bs,2)
+    admb=cv2.adaptiveThreshold(enhanced_grad,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,bs,2)
     admc,admbc=cv2.morphologyEx(adm,cv2.MORPH_OPEN,k3),cv2.morphologyEx(admb,cv2.MORPH_OPEN,k3)
     cam,_=cv2.findContours(admc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
     cag,_=cv2.findContours(admbc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-    ar={'block_size':bs,'C':3,'adp_mean_bin':admc,'adp_gauss_bin':admbc,'feats_mean':compute_features(cam,img.shape),'feats_gauss':compute_features(cag,img.shape)}
+    ar={'block_size':bs,'C':2,'adp_mean_bin':admc,'adp_gauss_bin':admbc,'feats_mean':compute_features(cam,img.shape),'feats_gauss':compute_features(cag,img.shape)}
     #保存5图
-    save_image(f'{OUT_DIR}/{stem}_1_分割结果.png',create_segmentation(img,pmc,dfmask))
+    save_image(f'{OUT_DIR}/{stem}_1_分割结果.png',create_segmentation(img,pmc,dfmask,enhanced))
     save_image(f'{OUT_DIR}/{stem}_2_框选标注.png',create_annotation(img,dfs,dn,dm,tm))
     save_image(f'{OUT_DIR}/{stem}_3_缺陷分类.png',create_classification(img,pmc,dfs,dn,dm,tm))
     save_csv(dfs,f'{OUT_DIR}/{stem}_4_特征统计.csv',dn,dm,tm)
@@ -152,7 +191,7 @@ def process_image(n):
     #txt统计
     cntdic={'裂纹':0,'气孔':0,'不规则缺陷':0,'数字':0,'正常纹理':0,'不规则纹理':0,'噪声':0}
     for f in dfs:cntdic[c(classify(f,dn,dm,tm)[0])]+=1
-    txt=[f'===={n}====',f'Otsu:{ot} Tri:{tr} 块:{bs} 阈值:噪声<{dn:.0f}小缺陷<{dm:.0f}大区≥{tm:.0f}',f'总数{len(dfs)} {cntdic}']
+    txt=[f'===={n}====',f'Otsu:{ot} Tri:{tr} 块:{bs} C:2 阈值:噪声<{dn:.0f}小缺陷<{dm:.0f}大区≥{tm:.0f} | CLAHE+锐化+梯度增强',f'总数{len(dfs)} {cntdic}']
     with open(f'{OUT_DIR}/{stem}_4_特征统计.txt','w',encoding='utf-8')as f:f.write('\n'.join(txt))
     print(f'{n}完成')
     return {'global':gr,'adaptive':ar,'defect_feats':dfs}
